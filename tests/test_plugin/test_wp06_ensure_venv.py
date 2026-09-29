@@ -60,7 +60,17 @@ def _run_venv_sh(
     timeout: int = 120,
 ) -> subprocess.CompletedProcess:
     """Run ensure-venv.sh with given ROOT and DATA dirs."""
-    env = {**os.environ, "CLAUDE_PLUGIN_ROOT": str(root), "CLAUDE_PLUGIN_DATA": str(data)}
+    # Prepend the venv running this test so the subprocess finds python3 >= 3.11.
+    venv_bin = str(Path(sys.executable).parent)
+    env = {
+        **os.environ,
+        "CLAUDE_PLUGIN_ROOT": str(root),
+        "CLAUDE_PLUGIN_DATA": str(data),
+        # Force SLM_LAUNCHER=plugin so an installed slm on PATH cannot short-circuit
+        # the venv bootstrap path under test.
+        "SLM_LAUNCHER": "plugin",
+        "PATH": f"{venv_bin}:{os.environ.get('PATH', '/usr/bin:/bin')}",
+    }
     if extra_env:
         env.update(extra_env)
     return subprocess.run(
@@ -280,12 +290,15 @@ def test_rejects_python_less_than_3_11(tmp_path: pytest.TempPathFactory) -> None
     )
     fake_py.chmod(fake_py.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 
-    # Run with fake python3 first in PATH
+    # Run with fake python3 first in PATH; force the plugin launcher so the skip-check
+    # cannot short-circuit before the guard
+    venv_bin = str(Path(sys.executable).parent)
     env = {
         **os.environ,
         "CLAUDE_PLUGIN_ROOT": str(root),
         "CLAUDE_PLUGIN_DATA": str(data),
-        "PATH": f"{fake_py_dir}:{os.environ.get('PATH', '/usr/bin:/bin')}",
+        "SLM_LAUNCHER": "plugin",
+        "PATH": f"{fake_py_dir}:{venv_bin}:{os.environ.get('PATH', '/usr/bin:/bin')}",
     }
     result = subprocess.run(
         [str(ENSURE_VENV_SH)],
@@ -302,3 +315,51 @@ def test_rejects_python_less_than_3_11(tmp_path: pytest.TempPathFactory) -> None
         f"Script must emit an error message to stderr when python3 < 3.11. "
         f"stderr={result.stderr!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# T9 — Skips venv bootstrap under SLM_LAUNCHER=auto when an slm is on PATH
+# ---------------------------------------------------------------------------
+def test_skips_when_auto_and_slm_on_path(tmp_path: pytest.TempPathFactory) -> None:
+    root, data = _make_roots(tmp_path)
+
+    fake_bin = tmp_path / "fakebin"
+    fake_bin.mkdir()
+    fake_slm = fake_bin / "slm"
+    fake_slm.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    fake_slm.chmod(fake_slm.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+
+    for launcher_val in ("auto", None):
+        extra = {"PATH": f"{fake_bin}:{os.environ.get('PATH', '/usr/bin:/bin')}"}
+        if launcher_val is None:
+            env_base = {k: v for k, v in os.environ.items() if k != "SLM_LAUNCHER"}
+            result = subprocess.run(
+                [str(ENSURE_VENV_SH)],
+                env={**env_base, "CLAUDE_PLUGIN_ROOT": str(root),
+                     "CLAUDE_PLUGIN_DATA": str(data), **extra},
+                capture_output=True, text=True, timeout=30,
+            )
+        else:
+            result = _run_venv_sh(root, data, extra_env={"SLM_LAUNCHER": launcher_val, **extra})
+        assert result.returncode == 0, (
+            f"Should skip with rc=0 for SLM_LAUNCHER={launcher_val!r}. stderr={result.stderr!r}"
+        )
+        assert not (data / "venv").exists(), (
+            f"Venv must NOT be created for SLM_LAUNCHER={launcher_val!r} with slm on PATH"
+        )
+
+
+# ---------------------------------------------------------------------------
+# T10 — Skips venv bootstrap when SLM_LAUNCHER is system or an explicit path
+# ---------------------------------------------------------------------------
+def test_skips_when_launcher_is_not_plugin(tmp_path: pytest.TempPathFactory) -> None:
+    root, data = _make_roots(tmp_path)
+
+    for launcher_val in ("system", "/usr/local/bin/slm", "~/.local/bin/slm"):
+        result = _run_venv_sh(root, data, extra_env={"SLM_LAUNCHER": launcher_val})
+        assert result.returncode == 0, (
+            f"Should skip with rc=0 for SLM_LAUNCHER={launcher_val!r}. stderr={result.stderr!r}"
+        )
+        assert not (data / "venv").exists(), (
+            f"Venv must NOT be created for SLM_LAUNCHER={launcher_val!r}"
+        )

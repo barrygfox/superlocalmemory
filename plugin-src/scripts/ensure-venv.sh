@@ -25,6 +25,18 @@ set -euo pipefail
 exec 1>&2
 
 # ---------------------------------------------------------------------------
+# Skip venv bootstrap when slm-launch will not use the plugin venv. Mirrors its
+# selection: system / explicit path never use it; auto uses it only when no
+# slm is on PATH; plugin always does. Runs before the Python guard so a host
+# whose system python3 is < 3.11 but has its own slm install stays quiet.
+# ---------------------------------------------------------------------------
+case "${SLM_LAUNCHER:-auto}" in
+    plugin) ;;
+    auto) command -v slm >/dev/null 2>&1 && exit 0 ;;
+    *) exit 0 ;;
+esac
+
+# ---------------------------------------------------------------------------
 # Python >= 3.11 guard
 # ---------------------------------------------------------------------------
 if ! python3 -c "import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)" 2>/dev/null; then
